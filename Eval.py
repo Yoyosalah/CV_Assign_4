@@ -1,59 +1,57 @@
+# eval.py
 import torch
 import torch.nn as nn
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
 import os
 
-from main import ResNet18, dataloader, evaluate, print_metrics, VGG19, DenseNet121
+from main import dataloader, evaluate, print_metrics, VGG19, ResNet18, DenseNet121, MobileNet, InceptionV3
+from transfer_learning import get_densenet_tl_model
 
+def evaluate_saved_model(model_name, model_path, model, loaders, criterion, device, class_names):
+    if not os.path.exists(model_path):
+        return
 
-def evaluate_saved_model(model_path, model_class, data_dir, img_size=224):
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    _, _, test_loader, classes = dataloader(
-        data_dir=data_dir,
-        batch_size=32,
-        img_size=img_size,
-        train_split=0.7,
-        val_split=0.15,
-        test_split=0.15
-    )
-
-    model = model_class(num_classes=4).to(DEVICE)
-
-    try:
-        checkpoint = torch.load(model_path, map_location=DEVICE)
-        if isinstance(checkpoint, dict) and 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        else:
-            state_dict = checkpoint
-
-        model.load_state_dict(state_dict, strict=True)
-        print(f"✓ Successfully loaded model from {model_path}")
-    except RuntimeError as e:
-        print(f"⚠ Warning: Strict loading failed. Attempting with strict=False...")
-        incompatible_keys = model.load_state_dict(state_dict, strict=False)
-        if incompatible_keys.missing_keys or incompatible_keys.unexpected_keys:
-            print(f"Missing keys: {incompatible_keys.missing_keys}")
-            print(f"Unexpected keys: {incompatible_keys.unexpected_keys}")
-
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    criterion = nn.CrossEntropyLoss()
-    _, test_acc, preds, labels = evaluate(model, test_loader, criterion, DEVICE)
-    print(f"\nModel: {model_path}")
-    print(f"Test Accuracy: {test_acc:.2f}%")
-    print_metrics(labels, preds, classes)
+    print(f"\nModel: {model_name} ({model_path})")
 
+    for split_name, loader in loaders.items():
+        _, acc, preds, labels = evaluate(model, loader, criterion, device)
+        print(f"{split_name} Accuracy: {acc:.2f}%")
+        if split_name == 'Test':
+            print_metrics(labels, preds, class_names)
+
+def main():
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    DATA_DIR = "Dataset/Master Folder"
+    NUM_CLASSES = 4
+    BATCH_SIZE = 32
+
+    train_loader, val_loader, test_loader, classes = dataloader(
+        data_dir=DATA_DIR, 
+        batch_size=BATCH_SIZE, 
+        img_size=224
+    )
+    
+    loaders = {
+        'Train': train_loader,
+        'Validation': val_loader,
+        'Test': test_loader
+    }
+    
+    criterion = nn.CrossEntropyLoss()
+
+    models_list = [
+        ("VGG19", 'vgg19_best.pth', VGG19(num_classes=NUM_CLASSES).to(DEVICE)),
+        ("ResNet18", 'ResNet_best.pth', ResNet18(num_classes=NUM_CLASSES).to(DEVICE)),
+        ("DenseNet121", 'DenseNet_best.pth', DenseNet121(num_classes=NUM_CLASSES).to(DEVICE)),
+        ("MobileNet", 'MobileNet_best.pth', MobileNet(num_classes=NUM_CLASSES).to(DEVICE)),
+        ("InceptionV3", 'InceptionV3_best.pth', InceptionV3(num_classes=NUM_CLASSES).to(DEVICE)),
+        ("DenseNet121 Transfer Learning", 'DenseNet121_TransferLearning_best.pth', get_densenet_tl_model(NUM_CLASSES, DEVICE, pretrained=False))
+    ]
+
+    for model_name, model_path, model in models_list:
+        evaluate_saved_model(model_name, model_path, model, loaders, criterion, DEVICE, classes)
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("MODEL EVALUATION")
-    print("=" * 60 + "\n")
-
-    evaluate_saved_model('vgg19_best.pth', VGG19, "Dataset")
-    print("\n" + "=" * 60 + "\n")
-
-    evaluate_saved_model('ResNet_best.pth', ResNet18, "Dataset")
-    print("\n" + "=" * 60 + "\n")
-
-    evaluate_saved_model('DenseNet_best.pth', DenseNet121, "Dataset")
+    main()

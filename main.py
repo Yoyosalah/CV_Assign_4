@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader,random_split
 import torchvision.transforms as transforms
 from sklearn.metrics import classification_report, confusion_matrix
 import numpy as np
@@ -290,28 +290,58 @@ def data_transformer(img_size):
     return train_transforms, test_transforms
 
 
-def dataloader(data_dir, batch_size=32, img_size=224):
+def dataloader(data_dir, batch_size=32, img_size=224, train_split=0.7, val_split=0.15, test_split=0.15):
+    assert abs(train_split + val_split + test_split - 1.0) < 1e-6, \
+        f"Splits must sum to 1.0, got {train_split + val_split + test_split}"
+
     train_transforms, test_transforms = data_transformer(img_size)
 
-    train_dir = os.path.join(data_dir, 'train')
-    valid_dir = os.path.join(data_dir, 'valid')
-    test_dir = os.path.join(data_dir, 'test')
+    # Load entire dataset from root directory
+    print(f"Loading dataset from: {data_dir}")
+    full_dataset = datasets.ImageFolder(root=data_dir, transform=train_transforms)
 
-    train_dataset = datasets.ImageFolder(root=train_dir, transform=train_transforms)
-    val_dataset = datasets.ImageFolder(root=valid_dir, transform=test_transforms)
-    test_dataset = datasets.ImageFolder(root=test_dir, transform=test_transforms)
+    print(f"Classes found: {full_dataset.classes}")
+    print(f"Class-to-Index map: {full_dataset.class_to_idx}")
+    print(f"Total images: {len(full_dataset)}")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    # Calculate split sizes
+    total_size = len(full_dataset)
+    train_size = int(train_split * total_size)
+    val_size = int(val_split * total_size)
+    test_size = total_size - train_size - val_size  # Remainder goes to test
 
-    print(f"Classes found: {train_dataset.classes}")
-    print(f"Class-to-Index map: {train_dataset.class_to_idx}")
-    print(f"Training images: {len(train_dataset)}")
-    print(f"Validation images: {len(val_dataset)}")
-    print(f"Testing images: {len(test_dataset)}")
+    print(f"\nSplitting dataset:")
+    print(f"  Training:   {train_size} images ({train_split * 100:.1f}%)")
+    print(f"  Validation: {val_size} images ({val_split * 100:.1f}%)")
+    print(f"  Testing:    {test_size} images ({test_split * 100:.1f}%)")
 
-    return train_loader, val_loader, test_loader, train_dataset.classes
+    # Split dataset with fixed random seed for reproducibility
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset,
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    # Apply test transforms (no augmentation) to val and test sets
+    # We need to create new dataset objects with the test transform
+    val_dataset_no_aug = datasets.ImageFolder(root=data_dir, transform=test_transforms)
+    test_dataset_no_aug = datasets.ImageFolder(root=data_dir, transform=test_transforms)
+
+    # Get the same indices from the split
+    val_indices = val_dataset.indices
+    test_indices = test_dataset.indices
+
+    # Create subset datasets with test transforms
+    from torch.utils.data import Subset
+    val_dataset = Subset(val_dataset_no_aug, val_indices)
+    test_dataset = Subset(test_dataset_no_aug, test_indices)
+
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+    return train_loader, val_loader, test_loader, full_dataset.classes
 
 
 def main():
@@ -321,12 +351,16 @@ def main():
     BATCH_SIZE = 32
     LR = 0.001
     WEIGHT_DECAY = 5e-4
+    PATIENCE = 5  # Early stopping patience
     print(f"Device: {DEVICE}")
 
     train_loader, val_loader, test_loader, classes = dataloader(
-        data_dir="Dataset/Master Folder",
+        data_dir="Dataset",
         batch_size=BATCH_SIZE,
-        img_size=224
+        img_size=224,
+        train_split=0.7,
+        val_split=0.15,
+        test_split=0.15
     )
 
     #VGG model
@@ -338,7 +372,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    best_acc = 0.0
+    best_acc, best_loss, patience_counter = 0.0, float('inf'), 0
     for epoch in range(1, EPOCHS + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
         val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion, DEVICE)
@@ -346,9 +380,18 @@ def main():
         print(f"Epoch [{epoch:02d}/{EPOCHS}]  "
               f"Train Loss: {train_loss:.4f}  Train Acc: {train_acc:.2f}%  "
               f"Val Loss: {val_loss:.4f}  Val Acc: {val_acc:.2f}%")
+
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), 'vgg19_best.pth')
+
+        if val_loss < best_loss - 0.001:
+            best_loss, patience_counter = val_loss, 0
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"Early stopping at epoch {epoch}")
+                break
 
     print("\n── Final Evaluation (best checkpoint) ────────")
     model.load_state_dict(torch.load('vgg19_best.pth'))
@@ -365,7 +408,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    best_acc = 0.0
+    best_acc, best_loss, patience_counter = 0.0, float('inf'), 0
     for epoch in range(1, EPOCHS + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
         val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion, DEVICE)
@@ -373,9 +416,18 @@ def main():
         print(f"Epoch [{epoch:02d}/{EPOCHS}]  "
               f"Train Loss: {train_loss:.4f}  Train Acc: {train_acc:.2f}%  "
               f"Val Loss: {val_loss:.4f}  Val Acc: {val_acc:.2f}%")
+
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), 'ResNet_best.pth')
+
+        if val_loss < best_loss - 0.001:
+            best_loss, patience_counter = val_loss, 0
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"Early stopping at epoch {epoch}")
+                break
 
     print("\n── Final Evaluation (best checkpoint) ────────")
     model.load_state_dict(torch.load('ResNet_best.pth'))
@@ -392,7 +444,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    best_acc = 0.0
+    best_acc, best_loss, patience_counter = 0.0, float('inf'), 0
     for epoch in range(1, EPOCHS + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
         val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion, DEVICE)
@@ -400,9 +452,18 @@ def main():
         print(f"Epoch [{epoch:02d}/{EPOCHS}]  "
               f"Train Loss: {train_loss:.4f}  Train Acc: {train_acc:.2f}%  "
               f"Val Loss: {val_loss:.4f}  Val Acc: {val_acc:.2f}%")
+
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), 'DenseNet_best.pth')
+
+        if val_loss < best_loss - 0.001:
+            best_loss, patience_counter = val_loss, 0
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"Early stopping at epoch {epoch}")
+                break
 
     print("\n── Final Evaluation (best checkpoint) ────────")
     model.load_state_dict(torch.load('DenseNet_best.pth'))
